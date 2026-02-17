@@ -1,0 +1,185 @@
+from fastapi import FastAPI, Form, Response
+from twilio.twiml.messaging_response import MessagingResponse
+
+app = FastAPI()
+
+# --- CONFIGURATION (Add your credentials here for local testing) ---
+# NOTE: Never upload your real SID or TOKEN to GitHub.
+TWILIO_ACCOUNT_SID = "YOUR_ACCOUNT_SID_HERE"
+TWILIO_AUTH_TOKEN = "YOUR_AUTH_TOKEN_HERE"
+
+# --- HOME ROUTE ---
+@app.get("/")
+async def home():
+    """Returns a health-check message to verify the server is running."""
+    return {"Message": "Annapoorana WhatsApp Server is Live! 🙏"}
+
+# --- MENU DATABASE ---
+menu = {
+    "Starters": {"Honey Potato": 220, "Gobi 65": 150},
+    "Main Course": {"Chicken Briyani": 180, "Veg Briyani": 140},
+    "Desserts": {"Gulab Jamun": 40, "Ice Cream": 80},
+    "Beverages": {"Masala Chai": 30, "Filter Coffee": 40}
+}
+
+user_sessions = {}
+
+def get_main_menu_text(cart, is_new=True):
+    """Generates the main menu text with dynamic greetings and cart summary."""
+    if is_new:
+        text = "🙏 *Vanakkam! Welcome to Annapoorana's Kitchen.*\n"
+    else:
+        text = "✨ *Anything else would you like to order?*\n"
+    
+    text += "\nChoose a category:\n"
+    for cat in menu.keys():
+        text += f"• *{cat}*\n"
+    
+    if cart:
+        text += "\n🛒 *Current Cart:*"
+        total = 0
+        for item, qty in cart.items():
+            price = next((p for cat in menu.values() for i, p in cat.items() if i == item), 0)
+            text += f"\n- {item} x{qty} (₹{price*qty})"
+            total += (price * qty)
+        text += f"\n💰 *Total: ₹{total}*"
+    
+    text += "\n\n━━━━━━━━━━━━━━\n➕ Type **item name** to add (e.g. Honey Potato)\n➡️ Type **'Checkout'** to finish\n➡️ Type **'Reset'** to clear cart\n➡️ Type **'Remove [item]'** to delete"
+    return text
+
+@app.post("/whatsapp")
+async def handle_whatsapp(Body: str = Form(...), From: str = Form(...)):
+    """Webhook endpoint for Twilio WhatsApp integration."""
+    user_id = From
+    user_input = Body.strip()
+    user_input_lc = user_input.lower()
+    user_input_no_space = user_input_lc.replace(" ", "")
+    res = MessagingResponse()
+
+    # Initialize session if user is new
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {'cart': {}, 'state': 'menu', 'data': {}, 'pending_cat': None}
+    
+    session = user_sessions[user_id]
+    state = session['state']
+    cart = session['cart']
+
+    # Global Reset Command
+    if user_input_lc == "reset":
+        session.update({'cart': {}, 'state': 'menu', 'data': {}, 'pending_cat': None})
+        res.message(get_main_menu_text({}, is_new=True))
+        return Response(content=str(res), media_type="application/xml")
+
+    # --- STATE: MENU & ORDERING ---
+    if state == "menu":
+        matched_cat = next((c for c in menu.keys() if c.lower().replace(" ", "") == user_input_no_space), None)
+        
+        # Fuzzy Matching Typo Logic
+        if not matched_cat:
+            typo_keywords = ["man", "corse", "coser", "strtr", "dess", "bev"]
+            if any(x in user_input_no_space for x in typo_keywords):
+                potential = ""
+                if any(x in user_input_no_space for x in ["man", "corse", "coser"]): potential = "Main Course"
+                elif "strtr" in user_input_no_space: potential = "Starters"
+                elif "dess" in user_input_no_space: potential = "Desserts"
+                elif "bev" in user_input_no_space: potential = "Beverages"
+                
+                if potential:
+                    session['pending_cat'] = potential
+                    res.message(f"Excuse me Sir/Ma'am, are you looking for the *{potential}*? \n\nReply **'Yes'** to see it.")
+                    return Response(content=str(res), media_type="application/xml")
+
+        if user_input_lc == "yes" and session.get('pending_cat'):
+            matched_cat = session['pending_cat']
+            session['pending_cat'] = None
+
+        if matched_cat:
+            reply = f"📋 *{matched_cat} Menu:*\n"
+            for item, price in menu[matched_cat].items():
+                reply += f"✅ {item} - ₹{price}\n"
+            reply += "\nType the item name to add it to your cart."
+            res.message(reply)
+            return Response(content=str(res), media_type="application/xml")
+
+        # Item Removal
+        if user_input_lc.startswith("remove"):
+            item_name = user_input[7:].strip().title()
+            if item_name in cart:
+                del cart[item_name]
+                res.message(f"❌ Removed {item_name}.\n\n" + get_main_menu_text(cart, is_new=False))
+            else:
+                res.message(f"Item not in cart. {get_main_menu_text(cart, is_new=False)}")
+            return Response(content=str(res), media_type="application/xml")
+
+        # Adding Items Logic
+        for cat_items in menu.values():
+            for dish in cat_items:
+                if dish.lower() in user_input_lc:
+                    cart[dish] = cart.get(dish, 0) + 1
+                    res.message(f"✅ Added {dish}!\n\n" + get_main_menu_text(cart, is_new=False))
+                    return Response(content=str(res), media_type="application/xml")
+
+        if "checkout" in user_input_lc:
+            if not cart:
+                res.message("⚠️ Your cart is empty! Please add items first.")
+            else:
+                session['state'] = "step5_otp"
+                res.message("🔐 *Step 5:* Please enter your **6-digit OTP pin number** to proceed:")
+            return Response(content=str(res), media_type="application/xml")
+
+        res.message(get_main_menu_text(cart, is_new=True))
+
+    # --- STATE: CHECKOUT FLOW ---
+    elif state == "step5_otp":
+        if len(user_input) == 6 and user_input.isdigit():
+            session['state'] = "step6_name"
+            res.message("✅ OTP Verified. *Step 6:* May I have your **Name**, please?")
+        else:
+            res.message("❌ Invalid OTP. Please enter a 6-digit number.")
+
+    elif state == "step6_name":
+        session['data']['name'] = user_input
+        session['state'] = "step7_address"
+        res.message(f"Nice to meet you {user_input}! *Step 7:* Please enter your **Full Address**:")
+
+    elif state == "step7_address":
+        session['data']['address'] = user_input
+        session['state'] = "step8_pincode"
+        res.message("📍 Address Saved! *Step 8:* Please enter your **Pincode**:")
+
+    elif state == "step8_pincode":
+        session['data']['pincode'] = user_input
+        session['state'] = "step9_confirm"
+        summary = f"📝 *Order Summary*\n👤 Name: {session['data']['name']}\n📍 Address: {session['data']['address']}\n📮 Pincode: {user_input}"
+        summary += get_cart_summary_only(cart)
+        summary += "\n\nIs everything correct? Type **'Confirm'** to pay or **'Reset'** to restart."
+        res.message(summary)
+
+    elif state == "step9_confirm":
+        if "confirm" in user_input_lc:
+            session['state'] = "step10_pay"
+            res.message("💳 *Payment Link:* https://pay.annapoorana.com/test\n\nType **'Paid'** after transaction.")
+        else:
+            res.message("Type 'Confirm' to proceed.")
+
+    elif state == "step10_pay":
+        if "paid" in user_input_lc:
+            res.message("✅ *Order Confirmed!*\n\n🙏 *Nandri!* Your food will be ready soon.")
+            session.update({'cart': {}, 'state': 'menu', 'data': {}}) 
+        else:
+            res.message("Please type 'Paid' once the transaction is complete.")
+
+    return Response(content=str(res), media_type="application/xml")
+
+def get_cart_summary_only(cart):
+    """Utility function to generate the text summary of the cart."""
+    text = "\n\n🛒 *Items:* "
+    total = 0
+    for item, qty in cart.items():
+        price = 0
+        for cat in menu.values():
+            if item in cat: price = cat[item]
+        text += f"\n- {item} x{qty} (₹{price*qty})"
+        total += (price * qty)
+    text += f"\n💰 *Total: ₹{total}*"
+    return text
